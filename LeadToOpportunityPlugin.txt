@@ -1,0 +1,536 @@
+using Microsoft.Xrm.Sdk;
+using Microsoft.Xrm.Sdk.Query;
+using System;
+
+namespace BSS.Sales.Plugins
+{
+  public class QualifyLeadPlugin : IPlugin
+  {
+    // =========================================================
+    // ENTITY LOGICAL NAMES
+    // =========================================================
+
+    private const string LeadEntity = "bss_lead";
+    private const string AccountEntity = "bss_accounts";
+    private const string ContactEntity = "bss_contact";
+    private const string OpportunityEntity = "bss_opportunity";
+    private const string BpfEntity = "bss_leadtoopportunitysalesprocess";
+    private const string ProcessStageEntity = "processstage";
+
+
+    // =========================================================
+    // LEAD COLUMN LOGICAL NAMES
+    // =========================================================
+
+    private const string LeadCompanyName = "bss_lead_companyname";
+    private const string LeadEmail = "bss_lead_email";
+    private const string LeadFirstName = "bss_lead_firstname";
+    private const string LeadLastName = "bss_lead_lastname";
+    private const string LeadPhone = "bss_lead_mobilephone";
+    private const string LeadWebsite = "bss_lead_website";
+
+
+    // =========================================================
+    // LEAD LOOKUPS
+    // =========================================================
+
+    private const string LeadAccountLookup = "bss_account";
+    private const string LeadContactLookup = "bss_contact";
+    private const string LeadOpportunityLookup = "bss_qualifyingopportunityid";
+
+
+    // =========================================================
+    // ACCOUNT COLUMN LOGICAL NAMES
+    // =========================================================
+
+    private const string AccountName = "bss_accountname";
+    private const string AccountWebsite = "bss_website";
+
+
+    // =========================================================
+    // CONTACT COLUMN LOGICAL NAMES
+    // =========================================================
+
+    private const string ContactFullName = "bss_fullname";
+    private const string ContactEmail = "bss_email";
+    private const string ContactPhone = "bss_companyphone";
+    private const string ContactAccountLookup = "bss_parentcustomerid";
+
+
+    // =========================================================
+    // OPPORTUNITY COLUMN LOGICAL NAMES
+    // =========================================================
+
+    private const string OpportunityTopic = "bss_topic";
+    private const string OpportunityAccountLookup = "bss_account";
+    private const string OpportunityPotentialCustomerLookup = "bss_potentialcustomerid";
+    private const string OpportunityContactLookup = "bss_contact";
+    private const string OpportunityLeadLookup = "bss_lead";
+
+
+    // =========================================================
+    // BPF COLUMN LOGICAL NAMES
+    // =========================================================
+
+    private const string BpfLeadLookup = "bpf_bss_leadid";
+    private const string BpfOpportunityLookup = "bpf_bss_opportunityid";
+    private const string BpfActiveStage = "activestageid";
+    private const string BpfTraversedPath = "traversedpath";
+    private const string BpfProcessId = "processid";
+
+
+    // =========================================================
+    // PROCESS STAGE COLUMN LOGICAL NAMES
+    // =========================================================
+
+    private const string StageProcessId = "processid";
+    private const string StageName = "stagename";
+
+
+    // =========================================================
+    // BPF STAGE DISPLAY NAMES (as configured in the BPF designer)
+    // =========================================================
+
+    private const string StageNameQualify = "Qualify";
+    private const string StageNameDevelop = "Develop";
+
+
+    // =========================================================
+    // ACTION INPUT / OUTPUT
+    // =========================================================
+
+    private const string InputLeadId = "LeadId";
+    private const string OutputSuccess = "Success";
+    private const string OutputMessage = "Message";
+
+
+    // =========================================================
+    // EXECUTE
+    // =========================================================
+
+    public void Execute(IServiceProvider serviceProvider)
+    {
+      IPluginExecutionContext context =
+          (IPluginExecutionContext)serviceProvider.GetService(typeof(IPluginExecutionContext));
+
+      IOrganizationServiceFactory serviceFactory =
+          (IOrganizationServiceFactory)serviceProvider.GetService(typeof(IOrganizationServiceFactory));
+
+      IOrganizationService service = serviceFactory.CreateOrganizationService(context.UserId);
+
+      ITracingService tracing =
+          (ITracingService)serviceProvider.GetService(typeof(ITracingService));
+
+      try
+      {
+        tracing.Trace("======================================");
+        tracing.Trace("QualifyLeadPlugin STARTED");
+        tracing.Trace("======================================");
+
+        // 1. VALIDATE LEAD ID
+        if (!context.InputParameters.Contains(InputLeadId) ||
+            context.InputParameters[InputLeadId] == null)
+        {
+          throw new InvalidPluginExecutionException("LeadId is required.");
+        }
+
+        // 2. GET LEAD ID
+        EntityReference leadReference = context.InputParameters[InputLeadId] as EntityReference;
+
+        if (leadReference == null)
+        {
+          throw new InvalidPluginExecutionException("LeadId must be an EntityReference.");
+        }
+
+        Guid leadId = leadReference.Id;
+        tracing.Trace("Lead Id: {0}", leadId);
+
+        // 3. RETRIEVE LEAD
+        ColumnSet leadColumns = new ColumnSet(
+            LeadCompanyName, LeadEmail, LeadFirstName, LeadLastName,
+            LeadPhone, LeadWebsite, LeadOpportunityLookup);
+
+        Entity lead = service.Retrieve(LeadEntity, leadId, leadColumns);
+
+        if (lead == null)
+        {
+          throw new InvalidPluginExecutionException("Lead record was not found.");
+        }
+
+        tracing.Trace("Lead retrieved successfully.");
+
+        // 4. CHECK ALREADY QUALIFIED
+        EntityReference existingOpportunity =
+            lead.GetAttributeValue<EntityReference>(LeadOpportunityLookup);
+
+        if (existingOpportunity != null)
+        {
+          tracing.Trace("Lead is already qualified.");
+          throw new InvalidPluginExecutionException(
+              "This Lead has already been qualified and an Opportunity already exists.");
+        }
+
+        // 5. GET LEAD VALUES
+        string companyName = GetStringValue(lead, LeadCompanyName);
+        string email = GetStringValue(lead, LeadEmail);
+        string firstName = GetStringValue(lead, LeadFirstName);
+        string lastName = GetStringValue(lead, LeadLastName);
+        string phone = GetStringValue(lead, LeadPhone);
+        string website = GetStringValue(lead, LeadWebsite);
+
+        // 6. VALIDATE REQUIRED DATA
+        if (string.IsNullOrWhiteSpace(companyName))
+        {
+          throw new InvalidPluginExecutionException("Company Name is required to qualify the Lead.");
+        }
+
+        if (string.IsNullOrWhiteSpace(email))
+        {
+          throw new InvalidPluginExecutionException("Email is required to qualify the Lead.");
+        }
+
+        email = NormalizeEmail(email);
+
+        tracing.Trace("Company Name: {0}", companyName);
+        tracing.Trace("Email: {0}", email);
+
+        // 7. FIND OR CREATE ACCOUNT
+        EntityReference account = FindOrCreateAccount(service, tracing, companyName, website);
+        tracing.Trace("Account Id: {0}", account.Id);
+
+        // 8. FIND OR CREATE CONTACT
+        EntityReference contact = FindOrCreateContact(
+            service, tracing, email, firstName, lastName, phone, account.Id);
+        tracing.Trace("Contact Id: {0}", contact.Id);
+
+        // 9. CREATE OPPORTUNITY (leadId bhi pass ho raha hai, Lead lookup set karne ke liye)
+        EntityReference opportunity = CreateOpportunity(
+            service, tracing, companyName, account.Id, contact.Id, leadId);
+        tracing.Trace("Opportunity Id: {0}", opportunity.Id);
+
+        // 9B. LINK BPF INSTANCE TO THE NEW OPPORTUNITY
+        LinkBpfToOpportunity(service, tracing, leadId, opportunity);
+
+        // 10. UPDATE LEAD
+        tracing.Trace("Updating Lead...");
+
+        Entity leadUpdate = new Entity(LeadEntity, leadId);
+        leadUpdate[LeadAccountLookup] = account;
+        leadUpdate[LeadContactLookup] = contact;
+        leadUpdate[LeadOpportunityLookup] = opportunity;
+        leadUpdate["bss_statecode"] = new OptionSetValue(1);
+        leadUpdate["bss_statusreason"] = new OptionSetValue(3);
+
+        service.Update(leadUpdate);
+
+        tracing.Trace("Lead updated successfully.");
+
+        // 11. ACTION OUTPUT
+        context.OutputParameters[OutputSuccess] = true;
+        context.OutputParameters[OutputMessage] =
+            "Lead qualified successfully. Account and Contact were created/reused and a new Opportunity was created.";
+
+        tracing.Trace("======================================");
+        tracing.Trace("QualifyLeadPlugin COMPLETED SUCCESSFULLY");
+        tracing.Trace("======================================");
+      }
+      catch (Exception ex)
+      {
+        tracing.Trace("======================================");
+        tracing.Trace("QualifyLeadPlugin FAILED");
+        tracing.Trace(ex.ToString());
+        tracing.Trace("======================================");
+
+        context.OutputParameters[OutputSuccess] = false;
+        context.OutputParameters[OutputMessage] = "Lead qualification failed: " + ex.Message;
+
+        throw new InvalidPluginExecutionException("Lead qualification failed: " + ex.Message, ex);
+      }
+    }
+
+
+    // =========================================================
+    // FIND OR CREATE ACCOUNT
+    // =========================================================
+
+    private EntityReference FindOrCreateAccount(
+        IOrganizationService service,
+        ITracingService tracing,
+        string companyName,
+        string website)
+    {
+      QueryExpression accountQuery = new QueryExpression(AccountEntity);
+      accountQuery.ColumnSet = new ColumnSet(false);
+      accountQuery.TopCount = 2;
+      accountQuery.Criteria.AddCondition(AccountName, ConditionOperator.Equal, companyName);
+
+      EntityCollection accounts = service.RetrieveMultiple(accountQuery);
+
+      if (accounts.Entities.Count > 1)
+      {
+        throw new InvalidPluginExecutionException(
+            "Multiple Accounts found for Company Name: " + companyName +
+            ". Please resolve duplicate Accounts.");
+      }
+
+      if (accounts.Entities.Count == 1)
+      {
+        Entity existingAccount = accounts.Entities[0];
+        tracing.Trace("Existing Account found: {0}", existingAccount.Id);
+        return new EntityReference(AccountEntity, existingAccount.Id);
+      }
+
+      tracing.Trace("Account not found. Creating new Account...");
+
+      Entity newAccount = new Entity(AccountEntity);
+      newAccount[AccountName] = companyName;
+
+      if (!string.IsNullOrWhiteSpace(website))
+      {
+        newAccount[AccountWebsite] = website;
+      }
+
+      Guid accountId = service.Create(newAccount);
+      tracing.Trace("New Account created: {0}", accountId);
+
+      return new EntityReference(AccountEntity, accountId);
+    }
+
+
+    // =========================================================
+    // FIND OR CREATE CONTACT
+    // =========================================================
+
+    private EntityReference FindOrCreateContact(
+        IOrganizationService service,
+        ITracingService tracing,
+        string email,
+        string firstName,
+        string lastName,
+        string phone,
+        Guid accountId)
+    {
+      email = NormalizeEmail(email);
+
+      QueryExpression contactQuery = new QueryExpression(ContactEntity);
+      contactQuery.ColumnSet = new ColumnSet(false);
+      contactQuery.TopCount = 2;
+      contactQuery.Criteria.AddCondition(ContactEmail, ConditionOperator.Equal, email);
+
+      EntityCollection contacts = service.RetrieveMultiple(contactQuery);
+
+      if (contacts.Entities.Count > 1)
+      {
+        throw new InvalidPluginExecutionException(
+            "Multiple Contacts found with email: " + email + ". Please resolve duplicate Contacts.");
+      }
+
+      if (contacts.Entities.Count == 1)
+      {
+        Entity existingContact = contacts.Entities[0];
+        tracing.Trace("Existing Contact found: {0}", existingContact.Id);
+
+        Entity contactUpdate = new Entity(ContactEntity, existingContact.Id);
+        contactUpdate[ContactAccountLookup] = new EntityReference(AccountEntity, accountId);
+        service.Update(contactUpdate);
+
+        tracing.Trace("Existing Contact associated with Account.");
+
+        return new EntityReference(ContactEntity, existingContact.Id);
+      }
+
+      tracing.Trace("Contact not found. Creating new Contact...");
+
+      Entity newContact = new Entity(ContactEntity);
+
+      string fullName = BuildFullName(firstName, lastName);
+      if (!string.IsNullOrWhiteSpace(fullName))
+      {
+        newContact[ContactFullName] = fullName;
+      }
+
+      newContact[ContactEmail] = email;
+
+      if (!string.IsNullOrWhiteSpace(phone))
+      {
+        newContact[ContactPhone] = phone;
+      }
+
+      newContact[ContactAccountLookup] = new EntityReference(AccountEntity, accountId);
+
+      Guid contactId = service.Create(newContact);
+      tracing.Trace("New Contact created: {0}", contactId);
+
+      return new EntityReference(ContactEntity, contactId);
+    }
+
+
+    // =========================================================
+    // CREATE OPPORTUNITY
+    // =========================================================
+
+    private EntityReference CreateOpportunity(
+        IOrganizationService service,
+        ITracingService tracing,
+        string companyName,
+        Guid accountId,
+        Guid contactId,
+        Guid leadId)
+    {
+      tracing.Trace("Creating Opportunity...");
+
+      Entity opportunity = new Entity(OpportunityEntity);
+
+      opportunity[OpportunityTopic] = "Opportunity - " + companyName;
+      opportunity[OpportunityAccountLookup] = new EntityReference(AccountEntity, accountId);
+      opportunity[OpportunityPotentialCustomerLookup] = new EntityReference(AccountEntity, accountId);
+      opportunity[OpportunityContactLookup] = new EntityReference(ContactEntity, contactId);
+
+      // Link Opportunity back to the originating Lead
+      opportunity[OpportunityLeadLookup] = new EntityReference(LeadEntity, leadId);
+
+      Guid opportunityId = service.Create(opportunity);
+      tracing.Trace("New Opportunity created: {0}", opportunityId);
+
+      return new EntityReference(OpportunityEntity, opportunityId);
+    }
+
+
+    // =========================================================
+    // LINK BPF INSTANCE TO THE NEW OPPORTUNITY
+    // =========================================================
+
+    private void LinkBpfToOpportunity(
+        IOrganizationService service,
+        ITracingService tracing,
+        Guid leadId,
+        EntityReference opportunity)
+    {
+      tracing.Trace("Looking for existing BPF instance for Lead...");
+
+      QueryExpression bpfQuery = new QueryExpression(BpfEntity);
+      bpfQuery.ColumnSet = new ColumnSet(BpfProcessId);
+      bpfQuery.TopCount = 1;
+      bpfQuery.Criteria.AddCondition(BpfLeadLookup, ConditionOperator.Equal, leadId);
+
+      EntityCollection bpfInstances = service.RetrieveMultiple(bpfQuery);
+
+      if (bpfInstances.Entities.Count == 0)
+      {
+        tracing.Trace("No BPF instance found for this Lead. Skipping BPF linking.");
+        return;
+      }
+
+      Entity bpfInstance = bpfInstances.Entities[0];
+
+      EntityReference processRef =
+          bpfInstance.GetAttributeValue<EntityReference>(BpfProcessId);
+
+      if (processRef == null)
+      {
+        tracing.Trace("BPF instance has no process reference. Skipping BPF linking.");
+        return;
+      }
+
+      Guid qualifyStageId = GetStageId(service, tracing, processRef.Id, StageNameQualify);
+      Guid developStageId = GetStageId(service, tracing, processRef.Id, StageNameDevelop);
+
+      Entity bpfUpdate = new Entity(BpfEntity, bpfInstance.Id);
+      bpfUpdate[BpfOpportunityLookup] = opportunity;
+      bpfUpdate[BpfActiveStage] = new EntityReference(ProcessStageEntity, developStageId);
+      bpfUpdate[BpfTraversedPath] = qualifyStageId.ToString() + "," + developStageId.ToString();
+
+      service.Update(bpfUpdate);
+
+      tracing.Trace("BPF instance linked to Opportunity and moved to Develop stage.");
+    }
+
+
+    // =========================================================
+    // GET STAGE ID BY NAME
+    // =========================================================
+
+    private Guid GetStageId(
+        IOrganizationService service,
+        ITracingService tracing,
+        Guid processId,
+        string stageName)
+    {
+      QueryExpression stageQuery = new QueryExpression(ProcessStageEntity);
+      stageQuery.ColumnSet = new ColumnSet(false);
+      stageQuery.TopCount = 1;
+      stageQuery.Criteria.AddCondition(StageProcessId, ConditionOperator.Equal, processId);
+      stageQuery.Criteria.AddCondition(StageName, ConditionOperator.Equal, stageName);
+
+      EntityCollection stages = service.RetrieveMultiple(stageQuery);
+
+      if (stages.Entities.Count == 0)
+      {
+        throw new InvalidPluginExecutionException(
+            "BPF stage not found: " + stageName + ". Check the stage display name in the BPF designer.");
+      }
+
+      tracing.Trace("Stage '{0}' found: {1}", stageName, stages.Entities[0].Id);
+
+      return stages.Entities[0].Id;
+    }
+
+
+    // =========================================================
+    // BUILD FULL NAME
+    // =========================================================
+
+    private string BuildFullName(string firstName, string lastName)
+    {
+      firstName = firstName == null ? string.Empty : firstName.Trim();
+      lastName = lastName == null ? string.Empty : lastName.Trim();
+
+      if (string.IsNullOrWhiteSpace(firstName))
+      {
+        return lastName;
+      }
+
+      if (string.IsNullOrWhiteSpace(lastName))
+      {
+        return firstName;
+      }
+
+      return firstName + " " + lastName;
+    }
+
+
+    // =========================================================
+    // GET STRING VALUE
+    // =========================================================
+
+    private string GetStringValue(Entity entity, string attributeName)
+    {
+      if (string.IsNullOrWhiteSpace(attributeName))
+      {
+        return string.Empty;
+      }
+
+      if (!entity.Contains(attributeName) || entity[attributeName] == null)
+      {
+        return string.Empty;
+      }
+
+      return entity[attributeName].ToString().Trim();
+    }
+
+
+    // =========================================================
+    // NORMALIZE EMAIL
+    // =========================================================
+
+    private string NormalizeEmail(string email)
+    {
+      if (string.IsNullOrWhiteSpace(email))
+      {
+        return string.Empty;
+      }
+
+      return email.Trim().ToLowerInvariant();
+    }
+  }
+}
